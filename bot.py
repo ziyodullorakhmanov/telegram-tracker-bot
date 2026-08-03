@@ -127,6 +127,15 @@ def init_db():
                 UNIQUE(chat_id, rating_date)
             )"""
         )
+        # Eski bazalarda deadline_time ustuni bo'lmasligi mumkin — mavjud bo'lmasa qo'shamiz
+        try:
+            conn.execute("ALTER TABLE goals ADD COLUMN deadline_time TEXT")
+        except sqlite3.OperationalError:
+            pass  # ustun allaqachon mavjud
+        try:
+            conn.execute("ALTER TABLE goals ADD COLUMN failed INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # ustun allaqachon mavjud
 
 
 def today_str():
@@ -145,12 +154,44 @@ def ensure_user(chat_id: int, name: str):
         )
 
 
-def add_goal(chat_id: int, text: str):
+def add_goal(chat_id: int, text: str) -> int:
     with closing(get_conn()) as conn, conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO goals (chat_id, text, task_date, created_at) VALUES (?,?,?,?)",
             (chat_id, text, today_str(), datetime.now().isoformat()),
         )
+        return cur.lastrowid
+
+
+def set_goal_deadline(chat_id: int, goal_id: int, deadline_time: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute(
+            "UPDATE goals SET deadline_time=? WHERE id=? AND chat_id=?",
+            (deadline_time, goal_id, chat_id),
+        )
+
+
+def get_goal(chat_id: int, goal_id: int):
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT * FROM goals WHERE id=? AND chat_id=?", (goal_id, chat_id)
+        ).fetchone()
+
+
+def get_pending_deadlines_today(chat_id: int = None):
+    """Bugungi, hali bajarilmagan va muddati bor tasklarni qaytaradi
+    (bot qayta ishga tushganda eslatmalarni tiklash uchun)."""
+    with closing(get_conn()) as conn:
+        if chat_id is not None:
+            return conn.execute(
+                """SELECT * FROM goals WHERE chat_id=? AND task_date=? 
+                   AND done=0 AND deadline_time IS NOT NULL""",
+                (chat_id, today_str()),
+            ).fetchall()
+        return conn.execute(
+            """SELECT * FROM goals WHERE task_date=? AND done=0 AND deadline_time IS NOT NULL""",
+            (today_str(),),
+        ).fetchall()
 
 
 def get_today_goals(chat_id: int):
@@ -164,7 +205,15 @@ def get_today_goals(chat_id: int):
 def mark_done(chat_id: int, goal_id: int) -> bool:
     with closing(get_conn()) as conn, conn:
         cur = conn.execute(
-            "UPDATE goals SET done=1 WHERE id=? AND chat_id=?", (goal_id, chat_id)
+            "UPDATE goals SET done=1, failed=0 WHERE id=? AND chat_id=?", (goal_id, chat_id)
+        )
+        return cur.rowcount > 0
+
+
+def mark_failed(chat_id: int, goal_id: int) -> bool:
+    with closing(get_conn()) as conn, conn:
+        cur = conn.execute(
+            "UPDATE goals SET failed=1, done=0 WHERE id=? AND chat_id=?", (goal_id, chat_id)
         )
         return cur.rowcount > 0
 
@@ -189,9 +238,10 @@ def save_rating(chat_id: int, rating: int, note: str = ""):
 def get_stats(chat_id: int, days: int = 7):
     with closing(get_conn()) as conn:
         goals = conn.execute(
-            "SELECT done, COUNT(*) as c FROM goals WHERE chat_id=? AND task_date >= date('now', ?) GROUP BY done",
+            """SELECT SUM(done) as done, SUM(failed) as failed, COUNT(*) as total
+               FROM goals WHERE chat_id=? AND task_date >= date('now', ?)""",
             (chat_id, f"-{days} days"),
-        ).fetchall()
+        ).fetchone()
         ratings = conn.execute(
             "SELECT AVG(rating) as avg_r, COUNT(*) as n FROM ratings WHERE chat_id=? AND rating_date >= date('now', ?)",
             (chat_id, f"-{days} days"),
@@ -222,9 +272,14 @@ async def get_ai_feedback(chat_id: int) -> str:
     if not goals and not logs:
         return "Bugun hali hech qanday task yoki yozuv qo'shmadingiz — tahlil qilishga narsa yo'q."
 
-    goals_text = "\n".join(
-        f"- [{'bajarildi' if g['done'] else 'bajarilmadi'}] {g['text']}" for g in goals
-    ) or "(task qo'shilmagan)"
+    def goal_status(g):
+        if g["done"]:
+            return "bajarildi"
+        if g["failed"]:
+            return "bajarilmadi (qilolmadi)"
+        return "hali belgilanmagan"
+
+    goals_text = "\n".join(f"- [{goal_status(g)}] {g['text']}" for g in goals) or "(task qo'shilmagan)"
     logs_text = "\n".join(f"- {l['text']}" for l in logs) or "(yozuv yo'q)"
 
     prompt = (
@@ -249,23 +304,42 @@ async def get_ai_feedback(chat_id: int) -> str:
         return "⚠️ AI tahlil olishda xatolik yuz berdi. Birozdan keyin qayta urinib ko'ring."
 
 
-def get_chart_data(chat_id: int, days: int = 14):
+def get_chart_data(chat_id: int, period: str = "daily"):
+    """period: 'daily' (oxirgi 14 kun), 'weekly' (oxirgi 12 hafta),
+    'monthly' (oxirgi 12 oy)."""
+    if period == "weekly":
+        goal_group = "strftime('%Y-W%W', task_date)"
+        rating_group = "strftime('%Y-W%W', rating_date)"
+        window = "-84 days"  # ~12 hafta
+    elif period == "monthly":
+        goal_group = "strftime('%Y-%m', task_date)"
+        rating_group = "strftime('%Y-%m', rating_date)"
+        window = "-365 days"  # ~12 oy
+    else:
+        goal_group = "task_date"
+        rating_group = "rating_date"
+        window = "-14 days"
+
     with closing(get_conn()) as conn:
         goal_rows = conn.execute(
-            """SELECT task_date as d, SUM(done) as done, COUNT(*) as total
+            f"""SELECT {goal_group} as d, SUM(done) as done, SUM(failed) as failed, COUNT(*) as total
                FROM goals WHERE chat_id=? AND task_date >= date('now', ?)
-               GROUP BY task_date ORDER BY task_date""",
-            (chat_id, f"-{days} days"),
+               GROUP BY d ORDER BY d""",
+            (chat_id, window),
         ).fetchall()
         rating_rows = conn.execute(
-            """SELECT rating_date as d, rating FROM ratings
+            f"""SELECT {rating_group} as d, AVG(rating) as rating FROM ratings
                WHERE chat_id=? AND rating_date >= date('now', ?)
-               ORDER BY rating_date""",
-            (chat_id, f"-{days} days"),
+               GROUP BY d ORDER BY d""",
+            (chat_id, window),
         ).fetchall()
     return {
-        "goals": [{"date": r["d"], "done": r["done"], "total": r["total"]} for r in goal_rows],
-        "ratings": [{"date": r["d"], "rating": r["rating"]} for r in rating_rows],
+        "period": period,
+        "goals": [
+            {"date": r["d"], "done": r["done"], "failed": r["failed"], "total": r["total"]}
+            for r in goal_rows
+        ],
+        "ratings": [{"date": r["d"], "rating": round(r["rating"], 1)} for r in rating_rows],
     }
 
 
@@ -287,9 +361,15 @@ def day_progress_text(chat_id: int) -> str:
     if not goals:
         return "Bugun hali maqsad qo'shmadingiz. /goal buyrug'i bilan qo'shing."
     done = sum(1 for g in goals if g["done"])
-    lines = [f"📋 Bugungi progress: {done}/{len(goals)} bajarildi\n"]
+    failed = sum(1 for g in goals if g["failed"])
+    lines = [f"📋 Bugungi progress: {done} bajarildi, {failed} bajarilmadi, {len(goals) - done - failed} kutilmoqda\n"]
     for g in goals:
-        mark = "✅" if g["done"] else "◻️"
+        if g["done"]:
+            mark = "✅"
+        elif g["failed"]:
+            mark = "❌"
+        else:
+            mark = "◻️"
         lines.append(f"{mark} #{g['id']} {g['text']}")
     return "\n".join(lines)
 
@@ -312,6 +392,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/feedback — bugungi ish sifati bo'yicha AI tahlil olish\n"
         "/stats — oxirgi 7 kunlik statistika\n"
         "/settime HH:MM — kechki eslatma vaqtini o'rnatish\n\n"
+        "Task qo'shganingizda, bot sizdan uni tugatish uchun aniq vaqt so'raydi — "
+        "shu vaqt kelganda alohida eslatma yuboradi.\n\n"
         "Shuningdek, menga oddiy xabar yozsangiz (masalan, nima qilganingiz haqida), "
         "men uni kundaligingizga yozib qo'yaman va joriy progressni ko'rsataman.\n\n"
         "Pastdagi tugmali menyudan ham foydalanishingiz mumkin 👇"
@@ -327,8 +409,13 @@ async def cmd_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Foydalanish: /goal Kod yozib bo'lish")
         return
     text = " ".join(context.args)
-    add_goal(chat_id, text)
-    await update.message.reply_text(f"✅ Maqsad qo'shildi: {text}")
+    goal_id = add_goal(chat_id, text)
+    context.user_data["awaiting_deadline_for_goal"] = goal_id
+    await update.message.reply_text(
+        f"✅ Maqsad qo'shildi: {text}\n\n"
+        "Bu taskni tugatish uchun aniq vaqt belgilaysizmi? "
+        "Vaqtni HH:MM formatida yozing (masalan 18:30), yoki \"yo'q\" deb yozing."
+    )
 
 
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,14 +425,17 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bugun hali maqsad qo'shmadingiz. /goal buyrug'i bilan qo'shing.")
         return
     buttons = [
-        [InlineKeyboardButton(f"{'✅' if g['done'] else '◻️'} {g['text']}", callback_data=f"done:{g['id']}")]
-        for g in goals if not g["done"]
+        [
+            InlineKeyboardButton(f"✅ {g['text'][:20]}", callback_data=f"done:{g['id']}"),
+            InlineKeyboardButton("❌ Qilolmadim", callback_data=f"fail:{g['id']}"),
+        ]
+        for g in goals if not g["done"] and not g["failed"]
     ]
     text = day_progress_text(chat_id)
     if buttons:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     else:
-        await update.message.reply_text(text + "\n\n🎉 Barcha tasklar bajarildi!")
+        await update.message.reply_text(text + "\n\n🎉 Barcha tasklar belgilandi!")
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,6 +457,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("done:"):
         goal_id = int(query.data.split(":")[1])
         mark_done(chat_id, goal_id)
+        await query.edit_message_text(day_progress_text(chat_id))
+    elif query.data.startswith("fail:"):
+        goal_id = int(query.data.split(":")[1])
+        mark_failed(chat_id, goal_id)
         await query.edit_message_text(day_progress_text(chat_id))
     elif query.data.startswith("rate:"):
         rating = int(query.data.split(":")[1])
@@ -393,14 +487,19 @@ async def cmd_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     goals, ratings = get_stats(chat_id, days=7)
-    done = sum(row["c"] for row in goals if row["done"] == 1)
-    total = sum(row["c"] for row in goals)
-    pct = round(100 * done / total) if total else 0
+    done = goals["done"] or 0
+    failed = goals["failed"] or 0
+    total = goals["total"] or 0
+    addressed = done + failed  # javob berilgan (bajarilgan yoki bajarilmagan) tasklar
+    pct = round(100 * done / addressed) if addressed else 0
     avg_r = round(ratings["avg_r"], 1) if ratings and ratings["avg_r"] else None
 
     text = (
         "📊 *Oxirgi 7 kunlik statistika*\n\n"
-        f"Tasklar: {done}/{total} bajarildi ({pct}%)\n"
+        f"✅ Bajarildi: {done}\n"
+        f"❌ Bajarilmadi: {failed}\n"
+        f"◻️ Hali belgilanmagan: {total - addressed}\n"
+        f"📈 Produktivlik: {pct}% (bajarilgan/(bajarilgan+bajarilmagan))\n"
         f"O'rtacha kun reytingi: {avg_r if avg_r is not None else 'hali baholanmagan'}/10\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -449,6 +548,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_goal_text"] = False
         context.user_data["awaiting_time_text"] = False
         context.user_data["awaiting_rating_note"] = False
+        context.user_data["awaiting_deadline_for_goal"] = None
 
     # Agar oxirgi baholashdan keyin izoh kutilayotgan bo'lsa
     if context.user_data.get("awaiting_rating_note"):
@@ -464,8 +564,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Menyu orqali "Task qo'shish" bosilgan bo'lsa, keyingi xabarni task sifatida kutamiz
     if context.user_data.get("awaiting_goal_text"):
         context.user_data["awaiting_goal_text"] = False
-        add_goal(chat_id, text)
-        await update.message.reply_text(f"✅ Maqsad qo'shildi: {text}")
+        goal_id = add_goal(chat_id, text)
+        context.user_data["awaiting_deadline_for_goal"] = goal_id
+        await update.message.reply_text(
+            f"✅ Maqsad qo'shildi: {text}\n\n"
+            "Bu taskni tugatish uchun aniq vaqt belgilaysizmi? "
+            "Vaqtni HH:MM formatida yozing (masalan 18:30), yoki \"yo'q\" deb yozing."
+        )
+        return
+
+    # Task uchun muddat (deadline) kiritilishini kutayotgan bo'lsak
+    pending_goal_id = context.user_data.get("awaiting_deadline_for_goal")
+    if pending_goal_id:
+        context.user_data["awaiting_deadline_for_goal"] = None
+        if text.strip().lower() in ("yo'q", "yoq", "yo'q.", "yoq.", "skip", "-"):
+            await update.message.reply_text("Yaxshi, bu task uchun eslatma o'rnatilmadi.")
+            return
+        try:
+            hh, mm = text.split(":")
+            deadline_t = dtime(int(hh), int(mm))
+        except Exception:
+            await update.message.reply_text(
+                "Noto'g'ri format, shuning uchun eslatma o'rnatilmadi. "
+                "Keyinroq qayta task qo'shganda HH:MM formatida kiriting."
+            )
+            return
+        set_goal_deadline(chat_id, pending_goal_id, text.strip())
+        goal = get_goal(chat_id, pending_goal_id)
+        scheduled = await schedule_deadline_reminder(context, chat_id, pending_goal_id, goal["text"], deadline_t)
+        if scheduled:
+            await update.message.reply_text(f"⏰ '{goal['text']}' uchun {text.strip()} da eslatma o'rnatildi.")
+        else:
+            await update.message.reply_text(
+                f"⚠️ {text.strip()} vaqti allaqachon o'tib ketgan (server vaqti bo'yicha), "
+                "shuning uchun eslatma o'rnatilmadi."
+            )
         return
 
     # Menyu orqali "Vaqtni sozlash" bosilgan bo'lsa, keyingi xabarni vaqt sifatida kutamiz
@@ -533,8 +666,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_evening_prompt(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     goals = get_today_goals(chat_id)
     done = sum(1 for g in goals if g["done"])
+    failed = sum(1 for g in goals if g["failed"])
     total = len(goals)
-    summary = f"Bugun {done}/{total} task bajardingiz." if total else "Bugun hech qanday task belgilamagansiz."
+    if total:
+        summary = f"Bugun {done} ta task bajardingiz, {failed} ta bajarilmadi (jami {total} ta)."
+    else:
+        summary = "Bugun hech qanday task belgilamagansiz."
 
     buttons = [
         [InlineKeyboardButton(str(i), callback_data=f"rate:{i}") for i in range(1, 6)],
@@ -575,6 +712,58 @@ async def schedule_all_reminders(app: Application):
             time=dtime(int(hh), int(mm)),
             chat_id=u["chat_id"],
             name=f"reminder_{u['chat_id']}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# TASK MUDDATI (deadline) ESLATMASI
+# ---------------------------------------------------------------------------
+
+async def deadline_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    await context.bot.send_message(
+        chat_id=data["chat_id"],
+        text=f"⏰ Eslatma: \"{data['text']}\" vazifasini tugatish vaqti keldi!",
+    )
+
+
+async def schedule_deadline_reminder(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, goal_id: int, goal_text: str, deadline_t: dtime
+) -> bool:
+    """Bugungi sana + berilgan vaqt uchun bir martalik eslatma rejalashtiradi.
+    Vaqt allaqachon o'tib ketgan bo'lsa, False qaytaradi."""
+    target = datetime.combine(date.today(), deadline_t)
+    if target <= datetime.now():
+        return False
+    for job in context.job_queue.get_jobs_by_name(f"deadline_{chat_id}_{goal_id}"):
+        job.schedule_removal()
+    context.job_queue.run_once(
+        deadline_reminder_job,
+        when=target,
+        data={"chat_id": chat_id, "text": goal_text},
+        name=f"deadline_{chat_id}_{goal_id}",
+    )
+    return True
+
+
+async def reschedule_pending_deadlines(app: Application):
+    """Bot qayta ishga tushganda, bugungi hali o'tmagan muddatli tasklar
+    uchun eslatmalarni qayta rejalashtiradi (redeploy paytida yo'qolib qolmasin)."""
+    goals = get_pending_deadlines_today()
+    now = datetime.now()
+    for g in goals:
+        try:
+            hh, mm = g["deadline_time"].split(":")
+            target = datetime.combine(date.today(), dtime(int(hh), int(mm)))
+        except Exception:
+            continue
+        if target <= now:
+            continue
+        app.job_queue.run_once(
+            deadline_reminder_job,
+            when=target,
+            data={"chat_id": g["chat_id"], "text": g["text"]},
+            name=f"deadline_{g['chat_id']}_{g['id']}",
         )
 
 
@@ -635,12 +824,14 @@ if web_app:
             return HTMLResponse(content=f.read(), media_type="application/javascript")
 
     @web_app.get("/api/stats")
-    async def api_stats(initData: str = Query(default="")):
+    async def api_stats(initData: str = Query(default=""), period: str = Query(default="daily")):
         user = verify_init_data(initData, BOT_TOKEN)
         if not user:
             return JSONResponse({"error": "invalid_init_data"}, status_code=401)
+        if period not in ("daily", "weekly", "monthly"):
+            period = "daily"
         chat_id = user["id"]
-        data = get_chart_data(chat_id, days=14)
+        data = get_chart_data(chat_id, period=period)
         return JSONResponse(data)
 
     @web_app.get("/health")
@@ -678,7 +869,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.job_queue.run_once(lambda ctx: None, when=0)  # job_queue ishga tushishini ta'minlash
-    app.post_init = schedule_all_reminders
+    async def _post_init(app: Application):
+        await schedule_all_reminders(app)
+        await reschedule_pending_deadlines(app)
+
+    app.post_init = _post_init
 
     if web_app:
         threading.Thread(target=run_webserver, daemon=True).start()
