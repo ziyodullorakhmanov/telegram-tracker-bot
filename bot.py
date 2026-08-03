@@ -150,6 +150,15 @@ def init_db():
             pass  # ustun allaqachon mavjud
 
 
+def escape_md(text: str) -> str:
+    """Telegram Markdown (v1) maxsus belgilarini xavfsiz qilib escape qiladi.
+    Foydalanuvchi kiritgan yoki AI generatsiya qilgan matnni Markdown bilan
+    yuborishdan oldin ishlatiladi, aks holda 'Can't parse entities' xatosi chiqadi."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 def today_str():
     return date.today().isoformat()
 
@@ -449,8 +458,9 @@ async def restrict_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(update.effective_chat.id, user.first_name or "")
+    safe_name = escape_md(user.first_name or "")
     text = (
-        f"Salom, {user.first_name}! 👋\n\n"
+        f"Salom, {safe_name}! 👋\n\n"
         "Men sizning kunlik tasklaringiz, maqsadlaringiz va ish sifatingizni kuzatib boraman.\n\n"
         "*Buyruqlar:*\n"
         "/goal <matn> — bugungi maqsad/task qo'shish\n"
@@ -571,7 +581,9 @@ async def cmd_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     thinking_msg = await update.message.reply_text("🤔 Tahlil qilyapman...")
     feedback = await get_ai_feedback(chat_id)
-    await thinking_msg.edit_text(f"🧠 *AI tahlili*\n\n{feedback}", parse_mode=ParseMode.MARKDOWN)
+    # AI matni istalgan belgilarni o'z ichiga olishi mumkin, shuning uchun
+    # Markdown formatlashsiz, oddiy matn sifatida yuboramiz (xavfsizroq)
+    await thinking_msg.edit_text(f"🧠 AI tahlili\n\n{feedback}")
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
