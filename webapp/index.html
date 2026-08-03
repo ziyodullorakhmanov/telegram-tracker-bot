@@ -43,21 +43,24 @@
   }
   .stat-row {
     display: flex;
-    gap: 12px;
-    margin-bottom: 16px;
+    gap: 10px;
+    margin-bottom: 12px;
   }
   .stat-box {
     flex: 1;
     background: var(--card);
     border-radius: 16px;
-    padding: 16px;
+    padding: 14px 8px;
     text-align: center;
   }
   .stat-box .value {
-    font-size: 28px;
+    font-size: 22px;
     font-weight: 800;
     color: var(--accent);
   }
+  .stat-box .value.done { color: #4ade80; }
+  .stat-box .value.failed { color: #f87171; }
+  .stat-box .value.pending { color: var(--hint); }
   .stat-box .label {
     font-size: 12px;
     color: var(--hint);
@@ -182,8 +185,13 @@
 
     const totalDone = goals.reduce((s, g) => s + g.done, 0);
     const totalFailed = goals.reduce((s, g) => s + (g.failed || 0), 0);
-    const addressed = totalDone + totalFailed;
-    const pct = addressed ? Math.round((totalDone / addressed) * 100) : 0;
+    const totalTasks = goals.reduce((s, g) => s + g.total, 0);
+    const totalPending = totalTasks - totalDone - totalFailed;
+
+    const donePct = totalTasks ? Math.round((totalDone / totalTasks) * 100) : 0;
+    const failedPct = totalTasks ? Math.round((totalFailed / totalTasks) * 100) : 0;
+    const pendingPct = totalTasks ? Math.max(0, 100 - donePct - failedPct) : 0;
+
     const avgRating = ratings.length
       ? (ratings.reduce((s, r) => s + r.rating, 0) / ratings.length).toFixed(1)
       : "\u2014";
@@ -191,8 +199,22 @@
     content.innerHTML = `
       <div class="stat-row">
         <div class="stat-box">
-          <div class="value">${pct}%</div>
-          <div class="label">Produktivlik</div>
+          <div class="value done">${donePct}%</div>
+          <div class="label">✅ Bajarildi</div>
+        </div>
+        <div class="stat-box">
+          <div class="value failed">${failedPct}%</div>
+          <div class="label">❌ Qilolmadi</div>
+        </div>
+        <div class="stat-box">
+          <div class="value pending">${pendingPct}%</div>
+          <div class="label">◻️ Kutilmoqda</div>
+        </div>
+      </div>
+      <div class="stat-row">
+        <div class="stat-box">
+          <div class="value">${totalDone}/${totalTasks}</div>
+          <div class="label">Jami bajarilgan</div>
         </div>
         <div class="stat-box">
           <div class="value">${avgRating}</div>
@@ -213,26 +235,40 @@
     const hint = getComputedStyle(document.documentElement).getPropertyValue("--hint").trim() || "#9a9aa5";
 
     const goalLabels = goals.map(g => formatLabel(period, g.date));
-    const goalPercents = goals.map(g => {
-      const addr = g.done + (g.failed || 0);
-      return addr ? Math.round((g.done / addr) * 100) : 0;
-    });
+    const goalDonePercents = goals.map(g => g.total ? Math.round((g.done / g.total) * 100) : 0);
+    const goalFailedPercents = goals.map(g => g.total ? Math.round(((g.failed || 0) / g.total) * 100) : 0);
 
     goalsChartInstance = new Chart(document.getElementById("goalsChart"), {
       type: "bar",
       data: {
         labels: goalLabels,
-        datasets: [{
-          data: goalPercents,
-          backgroundColor: accent,
-          borderRadius: 6,
-        }],
+        datasets: [
+          {
+            label: "Bajarildi",
+            data: goalDonePercents,
+            backgroundColor: "#4ade80",
+            borderRadius: 6,
+            stack: "s",
+          },
+          {
+            label: "Qilolmadi",
+            data: goalFailedPercents,
+            backgroundColor: "#f87171",
+            borderRadius: 6,
+            stack: "s",
+          },
+        ],
       },
       options: {
-        plugins: { legend: { display: false } },
+        plugins: {
+          legend: {
+            display: true,
+            labels: { color: hint, boxWidth: 12, font: { size: 11 } },
+          },
+        },
         scales: {
-          y: { min: 0, max: 100, ticks: { color: hint }, grid: { color: "rgba(255,255,255,0.06)" } },
-          x: { ticks: { color: hint }, grid: { display: false } },
+          y: { min: 0, max: 100, stacked: true, ticks: { color: hint }, grid: { color: "rgba(255,255,255,0.06)" } },
+          x: { stacked: true, ticks: { color: hint }, grid: { display: false } },
         },
       },
     });
