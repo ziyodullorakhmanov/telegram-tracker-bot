@@ -26,6 +26,11 @@ from telegram.ext import (
     filters,
 )
 
+try:
+    from anthropic import Anthropic
+except ImportError:  # anthropic o'rnatilmagan bo'lsa ham bot ishlashda davom etsin
+    Anthropic = None
+
 # ---------------------------------------------------------------------------
 # SOZLAMALAR
 # ---------------------------------------------------------------------------
@@ -33,6 +38,10 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "tracker.db")
 DEFAULT_REMINDER_TIME = "21:00"  # HH:MM, server vaqti bo'yicha (pastda tushuntirilgan)
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if (Anthropic and ANTHROPIC_API_KEY) else None
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -160,6 +169,56 @@ def get_stats(chat_id: int, days: int = 7):
         return goals, ratings
 
 
+def get_today_logs(chat_id: int):
+    with closing(get_conn()) as conn:
+        return conn.execute(
+            "SELECT text, created_at FROM logs WHERE chat_id=? AND log_date=? ORDER BY id",
+            (chat_id, today_str()),
+        ).fetchall()
+
+
+async def get_ai_feedback(chat_id: int) -> str:
+    """Bugungi tasklar va loglarni Claude API'ga yuborib, ish sifati bo'yicha
+    qisqa tahlil va 1-10 taklif reytingini oladi."""
+    if not ai_client:
+        return (
+            "⚠️ AI tahlil hozircha yoqilmagan. Buni yoqish uchun Railway'da "
+            "`ANTHROPIC_API_KEY` muhit o'zgaruvchisini qo'shing."
+        )
+
+    goals = get_today_goals(chat_id)
+    logs = get_today_logs(chat_id)
+
+    if not goals and not logs:
+        return "Bugun hali hech qanday task yoki yozuv qo'shmadingiz — tahlil qilishga narsa yo'q."
+
+    goals_text = "\n".join(
+        f"- [{'bajarildi' if g['done'] else 'bajarilmadi'}] {g['text']}" for g in goals
+    ) or "(task qo'shilmagan)"
+    logs_text = "\n".join(f"- {l['text']}" for l in logs) or "(yozuv yo'q)"
+
+    prompt = (
+        "Siz mehribon, lekin halol shaxsiy mahsuldorlik murabbiysiz. "
+        "Quyida foydalanuvchining bugungi tasklari va u yozgan ish loglari berilgan. "
+        "O'zbek tilida, 4-6 jumlada qisqa tahlil bering: nima yaxshi ketdi, "
+        "nimani yaxshilash mumkin, va oxirida \"Taklif reyting: X/10\" formatida "
+        "ish sifati bo'yicha o'z bahoingizni yozing.\n\n"
+        f"Bugungi tasklar:\n{goals_text}\n\nBugungi yozuvlar (loglar):\n{logs_text}"
+    )
+
+    try:
+        response = ai_client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
+        return "\n".join(parts).strip() or "AI javob berolmadi, birozdan keyin qayta urinib ko'ring."
+    except Exception as e:
+        logger.error(f"AI feedback xatosi: {e}")
+        return "⚠️ AI tahlil olishda xatolik yuz berdi. Birozdan keyin qayta urinib ko'ring."
+
+
 def day_progress_text(chat_id: int) -> str:
     goals = get_today_goals(chat_id)
     if not goals:
@@ -187,6 +246,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/goals — bugungi tasklar ro'yxati (bajarish uchun tugmalar bilan)\n"
         "/done <raqam> — taskni bajarildi deb belgilash\n"
         "/report — kunni yakunlab, 1-10 baholash\n"
+        "/feedback — bugungi ish sifati bo'yicha AI tahlil olish\n"
         "/stats — oxirgi 7 kunlik statistika\n"
         "/settime HH:MM — kechki eslatma vaqtini o'rnatish\n\n"
         "Shuningdek, menga oddiy xabar yozsangiz (masalan, nima qilganingiz haqida), "
@@ -248,14 +308,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rating = int(query.data.split(":")[1])
         save_rating(chat_id, rating)
         await query.edit_message_text(
-            f"Kun {rating}/10 deb baholandi. Rahmat! Ertaga ko'rishguncha 👋\n\n"
+            f"Kun {rating}/10 deb baholandi. Rahmat!\n\n"
             "Xohlasangiz, izoh yozib qo'yishingiz mumkin — u ham saqlanadi."
         )
         context.user_data["awaiting_rating_note"] = True
 
+        if ai_client:
+            thinking_msg = await context.bot.send_message(chat_id, "🤔 AI tahlil qilyapti...")
+            feedback = await get_ai_feedback(chat_id)
+            await thinking_msg.edit_text(f"🧠 *AI tahlili*\n\n{feedback}", parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_evening_prompt(update.effective_chat.id, context)
+
+
+async def cmd_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    thinking_msg = await update.message.reply_text("🤔 Tahlil qilyapman...")
+    feedback = await get_ai_feedback(chat_id)
+    await thinking_msg.edit_text(f"🧠 *AI tahlili*\n\n{feedback}", parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -387,6 +459,7 @@ def main():
     app.add_handler(CommandHandler("goals", cmd_goals))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("feedback", cmd_feedback))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CallbackQueryHandler(button_callback))
