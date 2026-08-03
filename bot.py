@@ -15,7 +15,21 @@ import sqlite3
 from datetime import datetime, date, time as dtime
 from contextlib import closing
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import hashlib
+import hmac
+import json
+import threading
+import time as time_module
+from urllib.parse import parse_qsl
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    WebAppInfo,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -31,6 +45,14 @@ try:
 except ImportError:  # anthropic o'rnatilmagan bo'lsa ham bot ishlashda davom etsin
     Anthropic = None
 
+try:
+    import uvicorn
+    from fastapi import FastAPI, Query
+    from fastapi.responses import HTMLResponse, JSONResponse
+except ImportError:  # fastapi/uvicorn o'rnatilmagan bo'lsa, mini-app o'chiriladi
+    uvicorn = None
+    FastAPI = None
+
 # ---------------------------------------------------------------------------
 # SOZLAMALAR
 # ---------------------------------------------------------------------------
@@ -42,6 +64,12 @@ DEFAULT_REMINDER_TIME = "21:00"  # HH:MM, server vaqti bo'yicha (pastda tushunti
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if (Anthropic and ANTHROPIC_API_KEY) else None
+
+# Railway'da Settings -> Networking -> Generate Domain orqali olingan havola,
+# masalan: https://telegram-tracker-bot-production.up.railway.app
+WEBAPP_BASE_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
+WEBAPP_URL = f"{WEBAPP_BASE_URL}/webapp" if WEBAPP_BASE_URL else None
+PORT = int(os.environ.get("PORT", "8080"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -219,6 +247,44 @@ async def get_ai_feedback(chat_id: int) -> str:
         return "⚠️ AI tahlil olishda xatolik yuz berdi. Birozdan keyin qayta urinib ko'ring."
 
 
+def get_chart_data(chat_id: int, days: int = 14):
+    with closing(get_conn()) as conn:
+        goal_rows = conn.execute(
+            """SELECT task_date as d, SUM(done) as done, COUNT(*) as total
+               FROM goals WHERE chat_id=? AND task_date >= date('now', ?)
+               GROUP BY task_date ORDER BY task_date""",
+            (chat_id, f"-{days} days"),
+        ).fetchall()
+        rating_rows = conn.execute(
+            """SELECT rating_date as d, rating FROM ratings
+               WHERE chat_id=? AND rating_date >= date('now', ?)
+               ORDER BY rating_date""",
+            (chat_id, f"-{days} days"),
+        ).fetchall()
+    return {
+        "goals": [{"date": r["d"], "done": r["done"], "total": r["total"]} for r in goal_rows],
+        "ratings": [{"date": r["d"], "rating": r["rating"]} for r in rating_rows],
+    }
+
+
+# ---------------------------------------------------------------------------
+# ASOSIY MENYU (reply keyboard)
+# ---------------------------------------------------------------------------
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    stats_button = (
+        KeyboardButton("📊 Statistika", web_app=WebAppInfo(url=WEBAPP_URL))
+        if WEBAPP_URL
+        else KeyboardButton("📊 Statistika")
+    )
+    rows = [
+        [KeyboardButton("➕ Task qo'shish"), KeyboardButton("📋 Bugungi tasklar")],
+        [KeyboardButton("🌙 Kunni yakunlash"), stats_button],
+        [KeyboardButton("🧠 AI tahlil"), KeyboardButton("⚙️ Vaqtni sozlash")],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
 def day_progress_text(chat_id: int) -> str:
     goals = get_today_goals(chat_id)
     if not goals:
@@ -250,9 +316,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats — oxirgi 7 kunlik statistika\n"
         "/settime HH:MM — kechki eslatma vaqtini o'rnatish\n\n"
         "Shuningdek, menga oddiy xabar yozsangiz (masalan, nima qilganingiz haqida), "
-        "men uni kundaligingizga yozib qo'yaman va joriy progressni ko'rsataman."
+        "men uni kundaligingizga yozib qo'yaman va joriy progressni ko'rsataman.\n\n"
+        "Pastdagi tugmali menyudan ham foydalanishingiz mumkin 👇"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
     await schedule_reminder(context, update.effective_chat.id, DEFAULT_REMINDER_TIME)
 
 
@@ -308,15 +375,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rating = int(query.data.split(":")[1])
         save_rating(chat_id, rating)
         await query.edit_message_text(
-            f"Kun {rating}/10 deb baholandi. Rahmat!\n\n"
-            "Xohlasangiz, izoh yozib qo'yishingiz mumkin — u ham saqlanadi."
+            f"Kun {rating}/10 deb baholandi. Rahmat! Ertaga ko'rishguncha 👋\n\n"
+            "Xohlasangiz, izoh yozib qo'yishingiz mumkin — u ham saqlanadi.\n"
+            "(AI tahlil olish uchun istalgan vaqt /feedback yozing)"
         )
         context.user_data["awaiting_rating_note"] = True
-
-        if ai_client:
-            thinking_msg = await context.bot.send_message(chat_id, "🤔 AI tahlil qilyapti...")
-            feedback = await get_ai_feedback(chat_id)
-            await thinking_msg.edit_text(f"🧠 *AI tahlili*\n\n{feedback}", parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -384,6 +447,57 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Izoh saqlandi. Rahmat! 🙌")
         return
 
+    # Menyu orqali "Task qo'shish" bosilgan bo'lsa, keyingi xabarni task sifatida kutamiz
+    if context.user_data.get("awaiting_goal_text"):
+        context.user_data["awaiting_goal_text"] = False
+        add_goal(chat_id, text)
+        await update.message.reply_text(f"✅ Maqsad qo'shildi: {text}")
+        return
+
+    # Menyu orqali "Vaqtni sozlash" bosilgan bo'lsa, keyingi xabarni vaqt sifatida kutamiz
+    if context.user_data.get("awaiting_time_text"):
+        context.user_data["awaiting_time_text"] = False
+        try:
+            hh, mm = text.split(":")
+            dtime(int(hh), int(mm))
+        except Exception:
+            await update.message.reply_text("Noto'g'ri format. Masalan: 21:00 deb yozing.")
+            return
+        with closing(get_conn()) as conn, conn:
+            conn.execute("UPDATE users SET reminder_time=? WHERE chat_id=?", (text, chat_id))
+        await schedule_reminder(context, chat_id, text)
+        await update.message.reply_text(f"⏰ Kechki eslatma vaqti {text} ga o'rnatildi.")
+        return
+
+    # --- Asosiy menyu tugmalari ---
+    if text == "➕ Task qo'shish":
+        context.user_data["awaiting_goal_text"] = True
+        await update.message.reply_text("Nimani qo'shmoqchisiz? Task matnini yozing:")
+        return
+
+    if text == "📋 Bugungi tasklar":
+        await cmd_goals(update, context)
+        return
+
+    if text == "🌙 Kunni yakunlash":
+        await send_evening_prompt(chat_id, context)
+        return
+
+    if text == "🧠 AI tahlil":
+        await cmd_feedback(update, context)
+        return
+
+    if text == "⚙️ Vaqtni sozlash":
+        context.user_data["awaiting_time_text"] = True
+        await update.message.reply_text("Kechki eslatma vaqtini yozing, masalan: 21:00")
+        return
+
+    if text == "📊 Statistika":
+        # WEBAPP_URL sozlanmagan bo'lsa, oddiy matnli statistikani ko'rsatamiz
+        await cmd_stats(update, context)
+        return
+
+    # Boshqa har qanday matn — kundalik log sifatida saqlanadi
     ensure_user(chat_id, update.effective_user.first_name or "")
     add_log(chat_id, text)
     await update.message.reply_text(
@@ -444,6 +558,71 @@ async def schedule_all_reminders(app: Application):
 
 
 # ---------------------------------------------------------------------------
+# MINI APP (Telegram WebApp) — FastAPI server
+# ---------------------------------------------------------------------------
+
+def verify_init_data(init_data: str, bot_token: str, max_age: int = 86400):
+    """Telegram WebApp initData'ni rasmiy algoritm bo'yicha tekshiradi.
+    https://core.telegram.org/bots/webapps#validating-data-received-via-the-web-app
+    """
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+    except ValueError:
+        return None
+
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+    secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+
+    auth_date = int(parsed.get("auth_date", 0))
+    if max_age and (time_module.time() - auth_date) > max_age:
+        return None
+
+    user_json = parsed.get("user")
+    if not user_json:
+        return None
+    return json.loads(user_json)
+
+
+web_app = FastAPI() if FastAPI else None
+
+if web_app:
+
+    @web_app.get("/webapp", response_class=HTMLResponse)
+    async def webapp_page():
+        html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp", "index.html")
+        with open(html_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @web_app.get("/api/stats")
+    async def api_stats(initData: str = Query(default="")):
+        user = verify_init_data(initData, BOT_TOKEN)
+        if not user:
+            return JSONResponse({"error": "invalid_init_data"}, status_code=401)
+        chat_id = user["id"]
+        data = get_chart_data(chat_id, days=14)
+        return JSONResponse(data)
+
+    @web_app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+
+def run_webserver():
+    if not web_app:
+        logger.warning("fastapi/uvicorn o'rnatilmagan — mini-app o'chirilgan.")
+        return
+    uvicorn.run(web_app, host="0.0.0.0", port=PORT, log_level="warning")
+
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -467,6 +646,10 @@ def main():
 
     app.job_queue.run_once(lambda ctx: None, when=0)  # job_queue ishga tushishini ta'minlash
     app.post_init = schedule_all_reminders
+
+    if web_app:
+        threading.Thread(target=run_webserver, daemon=True).start()
+        logger.info(f"Mini-app serveri {PORT} portda ishga tushdi...")
 
     logger.info("Bot ishga tushdi...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
