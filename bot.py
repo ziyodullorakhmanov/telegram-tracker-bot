@@ -407,15 +407,25 @@ def day_progress_text(chat_id: int) -> str:
     done = sum(1 for g in goals if g["done"])
     failed = sum(1 for g in goals if g["failed"])
     lines = [f"📋 Bugungi progress: {done} bajarildi, {failed} bajarilmadi, {len(goals) - done - failed} kutilmoqda\n"]
-    for g in goals:
+    for idx, g in enumerate(goals, start=1):
         if g["done"]:
             mark = "✅"
         elif g["failed"]:
             mark = "❌"
         else:
             mark = "◻️"
-        lines.append(f"{mark} #{g['id']} {g['text']}")
+        lines.append(f"{mark} #{idx} {g['text']}")
     return "\n".join(lines)
+
+
+def get_today_goal_by_number(chat_id: int, display_number: int):
+    """Kunlik ro'yxatdagi ko'rsatilgan raqam (1, 2, 3...) bo'yicha haqiqiy
+    task yozuvini topadi (chunki bazadagi ID global, lekin foydalanuvchiga
+    har doim 1 dan boshlanadigan raqam ko'rsatiladi)."""
+    goals = get_today_goals(chat_id)
+    if 1 <= display_number <= len(goals):
+        return goals[display_number - 1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -527,10 +537,11 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Foydalanish: /done 3  (task raqami)")
+        await update.message.reply_text("Foydalanish: /done 3  (bugungi ro'yxatdagi task raqami)")
         return
-    goal_id = int(context.args[0])
-    if mark_done(chat_id, goal_id):
+    display_number = int(context.args[0])
+    goal = get_today_goal_by_number(chat_id, display_number)
+    if goal and mark_done(chat_id, goal["id"]):
         await update.message.reply_text("✅ Bajarildi deb belgilandi!\n\n" + day_progress_text(chat_id))
     else:
         await update.message.reply_text("Bunday raqamli task topilmadi.")
