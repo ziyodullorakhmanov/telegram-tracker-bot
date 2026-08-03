@@ -22,6 +22,8 @@ import threading
 import time as time_module
 from urllib.parse import parse_qsl
 
+import httpx
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -70,6 +72,11 @@ TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "5"))
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if (Anthropic and ANTHROPIC_API_KEY) else None
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# AI_PROVIDER: "auto" (Gemini bo'lsa shuni, aks holda Anthropic), "gemini" yoki "anthropic"
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
 
 # Railway'da Settings -> Networking -> Generate Domain orqali olingan havola,
 # masalan: https://telegram-tracker-bot-production.up.railway.app
@@ -301,13 +308,58 @@ def get_today_logs(chat_id: int):
         ).fetchall()
 
 
+def _active_ai_provider() -> str | None:
+    """Qaysi AI provayder ishlatilishini aniqlaydi: 'gemini', 'anthropic' yoki None."""
+    if AI_PROVIDER == "gemini":
+        return "gemini" if GEMINI_API_KEY else None
+    if AI_PROVIDER == "anthropic":
+        return "anthropic" if ai_client else None
+    # "auto": Gemini kaliti bo'lsa, shuni afzal ko'ramiz (bepul), aks holda Anthropic
+    if GEMINI_API_KEY:
+        return "gemini"
+    if ai_client:
+        return "anthropic"
+    return None
+
+
+async def _call_gemini(prompt: str) -> str:
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    try:
+        candidates = data["candidates"]
+        parts = candidates[0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts).strip()
+    except (KeyError, IndexError):
+        logger.error(f"Gemini javobi kutilmagan formatda: {data}")
+        return ""
+
+
+async def _call_anthropic(prompt: str) -> str:
+    response = ai_client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
+    return "\n".join(parts).strip()
+
+
 async def get_ai_feedback(chat_id: int) -> str:
-    """Bugungi tasklar va loglarni Claude API'ga yuborib, ish sifati bo'yicha
-    qisqa tahlil va 1-10 taklif reytingini oladi."""
-    if not ai_client:
+    """Bugungi tasklar va loglarni AI'ga yuborib, ish sifati bo'yicha
+    qisqa tahlil va 1-10 taklif reytingini oladi (Gemini yoki Anthropic)."""
+    provider = _active_ai_provider()
+    if not provider:
         return (
             "⚠️ AI tahlil hozircha yoqilmagan. Buni yoqish uchun Railway'da "
-            "`ANTHROPIC_API_KEY` muhit o'zgaruvchisini qo'shing."
+            "`GEMINI_API_KEY` (bepul, tavsiya etiladi) yoki `ANTHROPIC_API_KEY` "
+            "muhit o'zgaruvchisini qo'shing."
         )
 
     goals = get_today_goals(chat_id)
@@ -336,15 +388,13 @@ async def get_ai_feedback(chat_id: int) -> str:
     )
 
     try:
-        response = ai_client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
-        return "\n".join(parts).strip() or "AI javob berolmadi, birozdan keyin qayta urinib ko'ring."
+        if provider == "gemini":
+            result = await _call_gemini(prompt)
+        else:
+            result = await _call_anthropic(prompt)
+        return result or "AI javob berolmadi, birozdan keyin qayta urinib ko'ring."
     except Exception as e:
-        logger.error(f"AI feedback xatosi: {e}")
+        logger.error(f"AI feedback xatosi ({provider}): {e}")
         return "⚠️ AI tahlil olishda xatolik yuz berdi. Birozdan keyin qayta urinib ko'ring."
 
 
