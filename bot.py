@@ -429,9 +429,26 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # FREE-TEXT HANDLER — darhol javob berish
 # ---------------------------------------------------------------------------
 
+MENU_BUTTON_TEXTS = {
+    "➕ Task qo'shish",
+    "📋 Bugungi tasklar",
+    "🌙 Kunni yakunlash",
+    "🧠 AI tahlil",
+    "⚙️ Vaqtni sozlash",
+    "📊 Statistika",
+}
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
+
+    # Agar foydalanuvchi biror "kutish" holatida turib, boshqa menyu tugmasini bossa —
+    # eski kutishni bekor qilamiz va yangi tugmani ishga tushiramiz (adashib bosishning oldini olish)
+    if text in MENU_BUTTON_TEXTS:
+        context.user_data["awaiting_goal_text"] = False
+        context.user_data["awaiting_time_text"] = False
+        context.user_data["awaiting_rating_note"] = False
 
     # Agar oxirgi baholashdan keyin izoh kutilayotgan bo'lsa
     if context.user_data.get("awaiting_rating_note"):
