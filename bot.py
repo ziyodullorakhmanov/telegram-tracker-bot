@@ -68,6 +68,8 @@ ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if (Anthropic and ANTHROPIC_API
 # Railway'da Settings -> Networking -> Generate Domain orqali olingan havola,
 # masalan: https://telegram-tracker-bot-production.up.railway.app
 WEBAPP_BASE_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")
+if WEBAPP_BASE_URL and not WEBAPP_BASE_URL.startswith(("http://", "https://")):
+    WEBAPP_BASE_URL = "https://" + WEBAPP_BASE_URL  # https:// unutilgan bo'lsa ham ishlasin
 WEBAPP_URL = f"{WEBAPP_BASE_URL}/webapp" if WEBAPP_BASE_URL else None
 PORT = int(os.environ.get("PORT", "8080"))
 
