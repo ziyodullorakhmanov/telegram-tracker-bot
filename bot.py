@@ -79,9 +79,11 @@ if WEBAPP_BASE_URL and not WEBAPP_BASE_URL.startswith(("http://", "https://")):
 WEBAPP_URL = f"{WEBAPP_BASE_URL}/webapp" if WEBAPP_BASE_URL else None
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Faqat shu Telegram foydalanuvchi ID'ga ruxsat berish uchun.
-# Bo'sh bo'lsa — cheklov yo'q (hamma foydalana oladi).
-ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "").strip()
+# Faqat shu Telegram foydalanuvchi ID'larga ruxsat berish uchun (vergul bilan ajratilgan
+# bo'lishi mumkin, masalan "12345,67890"). Bo'sh bo'lsa — cheklov yo'q (hamma foydalana oladi).
+ALLOWED_USER_IDS = {
+    uid.strip() for uid in os.environ.get("ALLOWED_USER_ID", "").split(",") if uid.strip()
+}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -419,19 +421,20 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"Sizning Telegram ID'ingiz: `{user.id}`\n\n"
-        "Buni Railway'dagi `ALLOWED_USER_ID` muhit o'zgaruvchisiga qo'ying, "
-        "shunda bot faqat sizga xizmat qiladi.",
+        "Buni Railway'dagi `ALLOWED_USER_ID` muhit o'zgaruvchisiga qo'ying "
+        "(bir nechta kishi uchun vergul bilan ajrating, masalan `12345,67890`), "
+        "shunda bot faqat shu ID'larga xizmat qiladi.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def restrict_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Har qanday yangilanishdan oldin ishlaydi (group=-1). ALLOWED_USER_ID
-    o'rnatilgan bo'lsa, faqat shu ID'ga ruxsat beradi, qolganlarini bloklaydi."""
-    if not ALLOWED_USER_ID:
+    """Har qanday yangilanishdan oldin ishlaydi (group=-1). ALLOWED_USER_IDS
+    o'rnatilgan bo'lsa, faqat shu ID'larga ruxsat beradi, qolganlarini bloklaydi."""
+    if not ALLOWED_USER_IDS:
         return  # cheklov o'rnatilmagan — hammaga ochiq
     user = update.effective_user
-    if user is None or str(user.id) != ALLOWED_USER_ID:
+    if user is None or str(user.id) not in ALLOWED_USER_IDS:
         if update.effective_message:
             await update.effective_message.reply_text(
                 "🔒 Kechirasiz, bu bot shaxsiy va faqat egasi uchun mo'ljallangan."
@@ -919,7 +922,7 @@ if web_app:
         user = verify_init_data(initData, BOT_TOKEN)
         if not user:
             return JSONResponse({"error": "invalid_init_data"}, status_code=401)
-        if ALLOWED_USER_ID and str(user["id"]) != ALLOWED_USER_ID:
+        if ALLOWED_USER_IDS and str(user["id"]) not in ALLOWED_USER_IDS:
             return JSONResponse({"error": "forbidden"}, status_code=403)
         if period not in ("daily", "weekly", "monthly"):
             period = "daily"
