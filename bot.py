@@ -611,6 +611,12 @@ if web_app:
         with open(html_path, "r", encoding="utf-8") as f:
             return f.read()
 
+    @web_app.get("/webapp/chart.umd.js")
+    async def chart_js():
+        js_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp", "chart.umd.js")
+        with open(js_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read(), media_type="application/javascript")
+
     @web_app.get("/api/stats")
     async def api_stats(initData: str = Query(default="")):
         user = verify_init_data(initData, BOT_TOKEN)
