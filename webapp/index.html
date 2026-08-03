@@ -76,10 +76,35 @@
     color: var(--hint);
     padding: 40px 16px;
   }
+  .period-switch {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .period-btn {
+    flex: 1;
+    background: var(--card);
+    color: var(--hint);
+    border: none;
+    border-radius: 12px;
+    padding: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .period-btn.active {
+    background: var(--accent);
+    color: #fff;
+  }
 </style>
 </head>
 <body>
   <h1>📊 Sizning statistikangiz</h1>
+  <div class="period-switch">
+    <button class="period-btn active" data-period="daily">Kunlik</button>
+    <button class="period-btn" data-period="weekly">Haftalik</button>
+    <button class="period-btn" data-period="monthly">Oylik</button>
+  </div>
   <div id="content">
     <div class="loading">Yuklanyapti...</div>
   </div>
@@ -91,55 +116,83 @@
     tg.expand();
   }
 
+  let goalsChartInstance = null;
+  let ratingChartInstance = null;
+  let currentPeriod = "daily";
+
+  document.querySelectorAll(".period-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".period-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      currentPeriod = btn.dataset.period;
+      loadStats();
+    });
+  });
+
   async function loadStats() {
     const initData = tg ? tg.initData : "";
     const content = document.getElementById("content");
-
-    // VAQTINCHALIK DIAGNOSTIKA — muammoni topgach olib tashlanadi
-    const debugInfo = `
-      <div style="font-size:11px;color:#888;background:#111;padding:8px;border-radius:8px;margin-bottom:12px;word-break:break-all;">
-        tg mavjud: ${!!tg}<br>
-        initData uzunligi: ${initData.length}<br>
-        platform: ${tg ? tg.platform : "yo'q"}<br>
-        version: ${tg ? tg.version : "yo'q"}
-      </div>
-    `;
+    content.innerHTML = '<div class="loading">Yuklanyapti...</div>';
 
     try {
-      const res = await fetch("/api/stats?initData=" + encodeURIComponent(initData));
+      const res = await fetch(
+        "/api/stats?initData=" + encodeURIComponent(initData) + "&period=" + currentPeriod
+      );
       if (!res.ok) {
-        content.innerHTML = debugInfo + '<div class="empty">Ma\'lumotlarni yuklab bo\'lmadi. Botni Telegram ichida oching.</div>';
+        content.innerHTML = '<div class="empty">Ma\'lumotlarni yuklab bo\'lmadi. Botni Telegram ichida oching.</div>';
         return;
       }
       const data = await res.json();
-      render(data, debugInfo);
+      render(data);
     } catch (e) {
-      content.innerHTML = debugInfo + '<div class="empty">Xatolik yuz berdi: ' + e.message + '</div>';
+      content.innerHTML = '<div class="empty">Xatolik yuz berdi: ' + e.message + '</div>';
     }
   }
 
-  function render(data, debugInfo = "") {
+  const PERIOD_LABELS = {
+    daily: "Kunlik bajarilish (%)",
+    weekly: "Haftalik bajarilish (%)",
+    monthly: "Oylik bajarilish (%)",
+  };
+  const RATING_LABELS = {
+    daily: "Kunlik reyting (1-10)",
+    weekly: "Haftalik o'rtacha reyting (1-10)",
+    monthly: "Oylik o'rtacha reyting (1-10)",
+  };
+
+  function formatLabel(period, raw) {
+    if (period === "daily") return raw.slice(5); // MM-DD
+    if (period === "weekly") return raw.replace(/^\d{4}-/, ""); // W31
+    return raw; // YYYY-MM
+  }
+
+  function render(data) {
     const content = document.getElementById("content");
     const goals = data.goals || [];
     const ratings = data.ratings || [];
+    const period = data.period || currentPeriod;
+
+    if (goalsChartInstance) { goalsChartInstance.destroy(); goalsChartInstance = null; }
+    if (ratingChartInstance) { ratingChartInstance.destroy(); ratingChartInstance = null; }
 
     if (goals.length === 0 && ratings.length === 0) {
-      content.innerHTML = debugInfo + '<div class="empty">Hali ma\'lumot yo\'q.<br>Tasklar qo\'shing va kunlaringizni baholang \u2014 shunda shu yerda grafik paydo bo\'ladi.</div>';
+      content.innerHTML = '<div class="empty">Hali ma\'lumot yo\'q.<br>Tasklar qo\'shing va kunlaringizni baholang \u2014 shunda shu yerda grafik paydo bo\'ladi.</div>';
       return;
     }
 
     const totalDone = goals.reduce((s, g) => s + g.done, 0);
-    const totalTasks = goals.reduce((s, g) => s + g.total, 0);
-    const pct = totalTasks ? Math.round((totalDone / totalTasks) * 100) : 0;
+    const totalFailed = goals.reduce((s, g) => s + (g.failed || 0), 0);
+    const addressed = totalDone + totalFailed;
+    const pct = addressed ? Math.round((totalDone / addressed) * 100) : 0;
     const avgRating = ratings.length
       ? (ratings.reduce((s, r) => s + r.rating, 0) / ratings.length).toFixed(1)
       : "\u2014";
 
-    content.innerHTML = debugInfo + `
+    content.innerHTML = `
       <div class="stat-row">
         <div class="stat-box">
           <div class="value">${pct}%</div>
-          <div class="label">Bajarilgan tasklar</div>
+          <div class="label">Produktivlik</div>
         </div>
         <div class="stat-box">
           <div class="value">${avgRating}</div>
@@ -147,11 +200,11 @@
         </div>
       </div>
       <div class="card">
-        <h2>Kunlik bajarilish (%)</h2>
+        <h2>${PERIOD_LABELS[period] || "Bajarilish (%)"}</h2>
         <canvas id="goalsChart"></canvas>
       </div>
       <div class="card">
-        <h2>Kunlik reyting (1-10)</h2>
+        <h2>${RATING_LABELS[period] || "Reyting"}</h2>
         <canvas id="ratingChart"></canvas>
       </div>
     `;
@@ -159,10 +212,13 @@
     const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#7c5cff";
     const hint = getComputedStyle(document.documentElement).getPropertyValue("--hint").trim() || "#9a9aa5";
 
-    const goalLabels = goals.map(g => g.date.slice(5));
-    const goalPercents = goals.map(g => g.total ? Math.round((g.done / g.total) * 100) : 0);
+    const goalLabels = goals.map(g => formatLabel(period, g.date));
+    const goalPercents = goals.map(g => {
+      const addr = g.done + (g.failed || 0);
+      return addr ? Math.round((g.done / addr) * 100) : 0;
+    });
 
-    new Chart(document.getElementById("goalsChart"), {
+    goalsChartInstance = new Chart(document.getElementById("goalsChart"), {
       type: "bar",
       data: {
         labels: goalLabels,
@@ -181,10 +237,10 @@
       },
     });
 
-    const ratingLabels = ratings.map(r => r.date.slice(5));
+    const ratingLabels = ratings.map(r => formatLabel(period, r.date));
     const ratingValues = ratings.map(r => r.rating);
 
-    new Chart(document.getElementById("ratingChart"), {
+    ratingChartInstance = new Chart(document.getElementById("ratingChart"), {
       type: "line",
       data: {
         labels: ratingLabels,
