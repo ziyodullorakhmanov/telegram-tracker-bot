@@ -12,7 +12,7 @@ Ishga tushirish:
 import logging
 import os
 import sqlite3
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 from contextlib import closing
 
 import hashlib
@@ -61,7 +61,11 @@ except ImportError:  # fastapi/uvicorn o'rnatilmagan bo'lsa, mini-app o'chirilad
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 DB_PATH = os.environ.get("DB_PATH", "tracker.db")
-DEFAULT_REMINDER_TIME = "21:00"  # HH:MM, server vaqti bo'yicha (pastda tushuntirilgan)
+DEFAULT_REMINDER_TIME = "21:00"  # HH:MM, foydalanuvchi mahalliy vaqti bo'yicha
+
+# Server (Railway) doim UTC vaqtida ishlaydi. Bu offset orqali foydalanuvchi
+# kiritgan mahalliy vaqt avtomatik UTC'ga o'giriladi. Toshkent = UTC+5 (standart).
+TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "5"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
@@ -146,6 +150,29 @@ def init_db():
 
 def today_str():
     return date.today().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# VAQT ZONASI YORDAMCHILARI
+# ---------------------------------------------------------------------------
+# Server har doim UTC vaqtida ishlaydi. Foydalanuvchi kiritadigan barcha
+# vaqtlar (kechki eslatma, task muddati) MAHALLIY vaqt deb qabul qilinadi
+# va rejalashtirishdan oldin UTC'ga o'giriladi.
+
+def local_now() -> datetime:
+    """Foydalanuvchining hozirgi mahalliy vaqti (server UTC vaqtiga offset qo'shilgan)."""
+    return datetime.now() + timedelta(hours=TZ_OFFSET_HOURS)
+
+
+def local_time_to_utc_time(local_t: dtime) -> dtime:
+    """Faqat vaqt (HH:MM) uchun — kunlik takrorlanuvchi eslatmalarda ishlatiladi."""
+    dummy = datetime.combine(date(2000, 1, 1), local_t) - timedelta(hours=TZ_OFFSET_HOURS)
+    return dummy.time()
+
+
+def local_datetime_to_utc(local_dt: datetime) -> datetime:
+    """To'liq sana+vaqt uchun — bir martalik (deadline) eslatmalarda ishlatiladi."""
+    return local_dt - timedelta(hours=TZ_OFFSET_HOURS)
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +661,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⏰ '{goal['text']}' uchun {text.strip()} da eslatma o'rnatildi.")
         else:
             await update.message.reply_text(
-                f"⚠️ {text.strip()} vaqti allaqachon o'tib ketgan (server vaqti bo'yicha), "
+                f"⚠️ {text.strip()} vaqti allaqachon o'tib ketgan, "
                 "shuning uchun eslatma o'rnatilmadi."
             )
         return
@@ -732,9 +759,10 @@ async def schedule_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, hh
     for job in context.job_queue.get_jobs_by_name(f"reminder_{chat_id}"):
         job.schedule_removal()
     hh, mm = hhmm.split(":")
+    utc_time = local_time_to_utc_time(dtime(int(hh), int(mm)))
     context.job_queue.run_daily(
         reminder_job,
-        time=dtime(int(hh), int(mm)),
+        time=utc_time,
         chat_id=chat_id,
         name=f"reminder_{chat_id}",
     )
@@ -745,9 +773,10 @@ async def schedule_all_reminders(app: Application):
         users = conn.execute("SELECT chat_id, reminder_time FROM users").fetchall()
     for u in users:
         hh, mm = u["reminder_time"].split(":")
+        utc_time = local_time_to_utc_time(dtime(int(hh), int(mm)))
         app.job_queue.run_daily(
             reminder_job,
-            time=dtime(int(hh), int(mm)),
+            time=utc_time,
             chat_id=u["chat_id"],
             name=f"reminder_{u['chat_id']}",
         )
@@ -768,16 +797,17 @@ async def deadline_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 async def schedule_deadline_reminder(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, goal_id: int, goal_text: str, deadline_t: dtime
 ) -> bool:
-    """Bugungi sana + berilgan vaqt uchun bir martalik eslatma rejalashtiradi.
+    """Bugungi sana + berilgan MAHALLIY vaqt uchun bir martalik eslatma rejalashtiradi.
     Vaqt allaqachon o'tib ketgan bo'lsa, False qaytaradi."""
-    target = datetime.combine(date.today(), deadline_t)
-    if target <= datetime.now():
+    local_target = datetime.combine(local_now().date(), deadline_t)
+    if local_target <= local_now():
         return False
+    utc_target = local_datetime_to_utc(local_target)
     for job in context.job_queue.get_jobs_by_name(f"deadline_{chat_id}_{goal_id}"):
         job.schedule_removal()
     context.job_queue.run_once(
         deadline_reminder_job,
-        when=target,
+        when=utc_target,
         data={"chat_id": chat_id, "text": goal_text},
         name=f"deadline_{chat_id}_{goal_id}",
     )
@@ -788,18 +818,19 @@ async def reschedule_pending_deadlines(app: Application):
     """Bot qayta ishga tushganda, bugungi hali o'tmagan muddatli tasklar
     uchun eslatmalarni qayta rejalashtiradi (redeploy paytida yo'qolib qolmasin)."""
     goals = get_pending_deadlines_today()
-    now = datetime.now()
+    now_local = local_now()
     for g in goals:
         try:
             hh, mm = g["deadline_time"].split(":")
-            target = datetime.combine(date.today(), dtime(int(hh), int(mm)))
+            local_target = datetime.combine(now_local.date(), dtime(int(hh), int(mm)))
         except Exception:
             continue
-        if target <= now:
+        if local_target <= now_local:
             continue
+        utc_target = local_datetime_to_utc(local_target)
         app.job_queue.run_once(
             deadline_reminder_job,
-            when=target,
+            when=utc_target,
             data={"chat_id": g["chat_id"], "text": g["text"]},
             name=f"deadline_{g['chat_id']}_{g['id']}",
         )
