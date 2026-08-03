@@ -274,14 +274,9 @@ def get_chart_data(chat_id: int, days: int = 14):
 # ---------------------------------------------------------------------------
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    stats_button = (
-        KeyboardButton("📊 Statistika", web_app=WebAppInfo(url=WEBAPP_URL))
-        if WEBAPP_URL
-        else KeyboardButton("📊 Statistika")
-    )
     rows = [
         [KeyboardButton("➕ Task qo'shish"), KeyboardButton("📋 Bugungi tasklar")],
-        [KeyboardButton("🌙 Kunni yakunlash"), stats_button],
+        [KeyboardButton("🌙 Kunni yakunlash"), KeyboardButton("📊 Statistika")],
         [KeyboardButton("🧠 AI tahlil"), KeyboardButton("⚙️ Vaqtni sozlash")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -495,8 +490,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "📊 Statistika":
-        # WEBAPP_URL sozlanmagan bo'lsa, oddiy matnli statistikani ko'rsatamiz
-        await cmd_stats(update, context)
+        if WEBAPP_URL:
+            inline_kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📊 Statistikani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]]
+            )
+            await update.message.reply_text(
+                "Interaktiv statistikani ochish uchun bosing 👇", reply_markup=inline_kb
+            )
+        else:
+            await cmd_stats(update, context)
         return
 
     # Boshqa har qanday matn — kundalik log sifatida saqlanadi
