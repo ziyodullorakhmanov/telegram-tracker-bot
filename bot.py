@@ -353,6 +353,62 @@ async def _call_anthropic(prompt: str) -> str:
     return "\n".join(parts).strip()
 
 
+CHAT_HISTORY_LIMIT = 20  # so'nggi nechta xabar eslab qolinadi (kontekst uchun)
+
+
+async def _call_gemini_chat(history: list) -> str:
+    contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in history]
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json={"contents": contents})
+        if resp.status_code >= 400:
+            logger.error(f"Gemini chat xatosi {resp.status_code}: {resp.text[:500]}")
+        resp.raise_for_status()
+        data = resp.json()
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts).strip()
+    except (KeyError, IndexError):
+        logger.error(f"Gemini chat javobi kutilmagan formatda: {data}")
+        return ""
+
+
+async def _call_anthropic_chat(history: list) -> str:
+    messages = [
+        {"role": "assistant" if h["role"] == "model" else "user", "content": h["text"]}
+        for h in history
+    ]
+    response = ai_client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=800,
+        messages=messages,
+    )
+    parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
+    return "\n".join(parts).strip()
+
+
+async def get_ai_chat_reply(history: list) -> str:
+    """Ko'p bosqichli erkin suhbat uchun AI'dan javob oladi (Gemini yoki Anthropic)."""
+    provider = _active_ai_provider()
+    if not provider:
+        return (
+            "⚠️ AI hozircha yoqilmagan. Railway'da `GEMINI_API_KEY` "
+            "(bepul) yoki `ANTHROPIC_API_KEY` muhit o'zgaruvchisini qo'shing."
+        )
+    try:
+        if provider == "gemini":
+            result = await _call_gemini_chat(history)
+        else:
+            result = await _call_anthropic_chat(history)
+        return result or "AI javob berolmadi, birozdan keyin qayta urinib ko'ring."
+    except Exception as e:
+        logger.error(f"AI chat xatosi ({provider}): {e}")
+        return "⚠️ AI bilan bog'lanishda xatolik yuz berdi. Birozdan keyin qayta urinib ko'ring."
+
+
 async def get_ai_feedback(chat_id: int) -> str:
     """Bugungi tasklar va loglarni AI'ga yuborib, ish sifati bo'yicha
     qisqa tahlil va 1-10 taklif reytingini oladi (Gemini yoki Anthropic)."""
@@ -448,6 +504,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("➕ Task qo'shish"), KeyboardButton("📋 Bugungi tasklar")],
         [KeyboardButton("🌙 Kunni yakunlash"), KeyboardButton("📊 Statistika")],
         [KeyboardButton("🧠 AI tahlil"), KeyboardButton("⚙️ Vaqtni sozlash")],
+        [KeyboardButton("💬 AI suhbat")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -531,7 +588,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/report — kunni yakunlab, 1-10 baholash\n"
         "/feedback — bugungi ish sifati bo'yicha AI tahlil olish\n"
         "/stats — oxirgi 7 kunlik statistika\n"
-        "/settime HH:MM — kechki eslatma vaqtini o'rnatish\n\n"
+        "/settime HH:MM — kechki eslatma vaqtini o'rnatish\n"
+        "/exit — AI suhbat rejimidan chiqish\n\n"
         "Task qo'shganingizda, bot sizdan uni tugatish uchun aniq vaqt so'raydi — "
         "shu vaqt kelganda alohida eslatma yuboradi.\n\n"
         "Shuningdek, menga oddiy xabar yozsangiz (masalan, nima qilganingiz haqida), "
@@ -649,6 +707,15 @@ async def cmd_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await thinking_msg.edit_text(f"🧠 AI tahlili\n\n{feedback}")
 
 
+async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("chat_mode"):
+        context.user_data["chat_mode"] = False
+        context.user_data["chat_history"] = []
+        await update.message.reply_text("👋 Suhbat rejimidan chiqdingiz. Asosiy menyu ishlayapti.")
+    else:
+        await update.message.reply_text("Siz hozir suhbat rejimida emassiz.")
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     goals, ratings = get_stats(chat_id, days=7)
@@ -700,6 +767,7 @@ MENU_BUTTON_TEXTS = {
     "🧠 AI tahlil",
     "⚙️ Vaqtni sozlash",
     "📊 Statistika",
+    "💬 AI suhbat",
 }
 
 
@@ -714,6 +782,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_time_text"] = False
         context.user_data["awaiting_rating_note"] = False
         context.user_data["awaiting_deadline_for_goal"] = None
+        if text != "💬 AI suhbat":
+            context.user_data["chat_mode"] = False
 
     # Agar oxirgi baholashdan keyin izoh kutilayotgan bo'lsa
     if context.user_data.get("awaiting_rating_note"):
@@ -814,6 +884,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await cmd_stats(update, context)
+        return
+
+    if text == "💬 AI suhbat":
+        context.user_data["chat_mode"] = True
+        context.user_data["chat_history"] = []
+        await update.message.reply_text(
+            "💬 Suhbat rejimiga o'tdingiz — endi menga istalgan narsani yozishingiz mumkin, "
+            "javob beraman. Chiqish uchun /exit yozing yoki boshqa menyu tugmasini bosing."
+        )
+        return
+
+    # Agar suhbat rejimida bo'lsak — xabarni AI'ga yuboramiz (kundalik logga yozmaymiz)
+    if context.user_data.get("chat_mode"):
+        history = context.user_data.setdefault("chat_history", [])
+        history.append({"role": "user", "text": text})
+        thinking_msg = await update.message.reply_text("🤔 ...")
+        reply = await get_ai_chat_reply(history)
+        history.append({"role": "model", "text": reply})
+        if len(history) > CHAT_HISTORY_LIMIT:
+            del history[: len(history) - CHAT_HISTORY_LIMIT]
+        await thinking_msg.edit_text(reply)
         return
 
     # Boshqa har qanday matn — kundalik log sifatida saqlanadi
@@ -1038,6 +1129,7 @@ def main():
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("feedback", cmd_feedback))
+    app.add_handler(CommandHandler("exit", cmd_exit))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CallbackQueryHandler(button_callback))
