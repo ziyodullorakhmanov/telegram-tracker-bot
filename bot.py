@@ -57,7 +57,7 @@ except ImportError:  # fastapi/uvicorn o'rnatilmagan bo'lsa, mini-app o'chirilad
 # SOZLAMALAR
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 DB_PATH = os.environ.get("DB_PATH", "tracker.db")
 DEFAULT_REMINDER_TIME = "21:00"  # HH:MM, server vaqti bo'yicha (pastda tushuntirilgan)
 
@@ -574,6 +574,7 @@ def verify_init_data(init_data: str, bot_token: str, max_age: int = 86400):
 
     received_hash = parsed.pop("hash", None)
     if not received_hash:
+        logger.warning("initData tekshiruvi: 'hash' maydoni topilmadi")
         return None
 
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
@@ -581,6 +582,11 @@ def verify_init_data(init_data: str, bot_token: str, max_age: int = 86400):
     computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(computed_hash, received_hash):
+        logger.warning(
+            f"initData tekshiruvi: hash mos kelmadi. "
+            f"kutilgan_boshi={computed_hash[:8]} olingan_boshi={received_hash[:8]} "
+            f"token_uzunligi={len(bot_token)}"
+        )
         return None
 
     auth_date = int(parsed.get("auth_date", 0))
