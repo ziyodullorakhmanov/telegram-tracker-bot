@@ -74,7 +74,7 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 ai_client = Anthropic(api_key=ANTHROPIC_API_KEY) if (Anthropic and ANTHROPIC_API_KEY) else None
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 # AI_PROVIDER: "auto" (Gemini bo'lsa shuni, aks holda Anthropic), "gemini" yoki "anthropic"
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "auto").strip().lower()
 
@@ -330,6 +330,8 @@ async def _call_gemini(prompt: str) -> str:
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload)
+        if resp.status_code >= 400:
+            logger.error(f"Gemini API xatosi {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
         data = resp.json()
     try:
