@@ -483,12 +483,10 @@ async def cmd_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+def build_goal_buttons(chat_id: int) -> InlineKeyboardMarkup | None:
+    """Hali bajarilmagan/bajarilmadi deb belgilanmagan tasklar uchun tugmalar yasaydi.
+    Hech qanday pending task qolmasa, None qaytaradi (tugmalarni olib tashlash uchun)."""
     goals = get_today_goals(chat_id)
-    if not goals:
-        await update.message.reply_text("Bugun hali maqsad qo'shmadingiz. /goal buyrug'i bilan qo'shing.")
-        return
     buttons = [
         [
             InlineKeyboardButton(f"✅ {g['text'][:20]}", callback_data=f"done:{g['id']}"),
@@ -496,9 +494,19 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         for g in goals if not g["done"] and not g["failed"]
     ]
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    goals = get_today_goals(chat_id)
+    if not goals:
+        await update.message.reply_text("Bugun hali maqsad qo'shmadingiz. /goal buyrug'i bilan qo'shing.")
+        return
     text = day_progress_text(chat_id)
-    if buttons:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    markup = build_goal_buttons(chat_id)
+    if markup:
+        await update.message.reply_text(text, reply_markup=markup)
     else:
         await update.message.reply_text(text + "\n\n🎉 Barcha tasklar belgilandi!")
 
@@ -522,11 +530,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("done:"):
         goal_id = int(query.data.split(":")[1])
         mark_done(chat_id, goal_id)
-        await query.edit_message_text(day_progress_text(chat_id))
+        markup = build_goal_buttons(chat_id)
+        try:
+            if markup:
+                await query.edit_message_text(day_progress_text(chat_id), reply_markup=markup)
+            else:
+                await query.edit_message_text(day_progress_text(chat_id) + "\n\n🎉 Barcha tasklar belgilandi!")
+        except Exception:
+            pass  # matn o'zgarmagan bo'lsa Telegram xato qaytarishi mumkin — e'tiborsiz qoldiramiz
     elif query.data.startswith("fail:"):
         goal_id = int(query.data.split(":")[1])
         mark_failed(chat_id, goal_id)
-        await query.edit_message_text(day_progress_text(chat_id))
+        markup = build_goal_buttons(chat_id)
+        try:
+            if markup:
+                await query.edit_message_text(day_progress_text(chat_id), reply_markup=markup)
+            else:
+                await query.edit_message_text(day_progress_text(chat_id) + "\n\n🎉 Barcha tasklar belgilandi!")
+        except Exception:
+            pass
     elif query.data.startswith("rate:"):
         rating = int(query.data.split(":")[1])
         save_rating(chat_id, rating)
