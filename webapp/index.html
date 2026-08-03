@@ -95,26 +95,36 @@
     const initData = tg ? tg.initData : "";
     const content = document.getElementById("content");
 
+    // VAQTINCHALIK DIAGNOSTIKA — muammoni topgach olib tashlanadi
+    const debugInfo = `
+      <div style="font-size:11px;color:#888;background:#111;padding:8px;border-radius:8px;margin-bottom:12px;word-break:break-all;">
+        tg mavjud: ${!!tg}<br>
+        initData uzunligi: ${initData.length}<br>
+        platform: ${tg ? tg.platform : "yo'q"}<br>
+        version: ${tg ? tg.version : "yo'q"}
+      </div>
+    `;
+
     try {
       const res = await fetch("/api/stats?initData=" + encodeURIComponent(initData));
       if (!res.ok) {
-        content.innerHTML = '<div class="empty">Ma\'lumotlarni yuklab bo\'lmadi. Botni Telegram ichida oching.</div>';
+        content.innerHTML = debugInfo + '<div class="empty">Ma\'lumotlarni yuklab bo\'lmadi. Botni Telegram ichida oching.</div>';
         return;
       }
       const data = await res.json();
-      render(data);
+      render(data, debugInfo);
     } catch (e) {
-      content.innerHTML = '<div class="empty">Xatolik yuz berdi: ' + e.message + '</div>';
+      content.innerHTML = debugInfo + '<div class="empty">Xatolik yuz berdi: ' + e.message + '</div>';
     }
   }
 
-  function render(data) {
+  function render(data, debugInfo = "") {
     const content = document.getElementById("content");
     const goals = data.goals || [];
     const ratings = data.ratings || [];
 
     if (goals.length === 0 && ratings.length === 0) {
-      content.innerHTML = '<div class="empty">Hali ma\'lumot yo\'q.<br>Tasklar qo\'shing va kunlaringizni baholang \u2014 shunda shu yerda grafik paydo bo\'ladi.</div>';
+      content.innerHTML = debugInfo + '<div class="empty">Hali ma\'lumot yo\'q.<br>Tasklar qo\'shing va kunlaringizni baholang \u2014 shunda shu yerda grafik paydo bo\'ladi.</div>';
       return;
     }
 
@@ -125,7 +135,7 @@
       ? (ratings.reduce((s, r) => s + r.rating, 0) / ratings.length).toFixed(1)
       : "\u2014";
 
-    content.innerHTML = `
+    content.innerHTML = debugInfo + `
       <div class="stat-row">
         <div class="stat-box">
           <div class="value">${pct}%</div>
