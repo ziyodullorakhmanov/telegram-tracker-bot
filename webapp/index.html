@@ -1,1 +1,204 @@
-index.html
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>Statistika</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #0f0f14);
+    --text: var(--tg-theme-text-color, #ffffff);
+    --hint: var(--tg-theme-hint-color, #9a9aa5);
+    --accent: var(--tg-theme-button-color, #7c5cff);
+    --card: var(--tg-theme-secondary-bg-color, #1a1a22);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 {
+    font-size: 20px;
+    margin: 4px 0 20px 0;
+    font-weight: 700;
+  }
+  .card {
+    background: var(--card);
+    border-radius: 16px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 14px;
+    color: var(--hint);
+    margin: 0 0 12px 0;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .stat-row {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .stat-box {
+    flex: 1;
+    background: var(--card);
+    border-radius: 16px;
+    padding: 16px;
+    text-align: center;
+  }
+  .stat-box .value {
+    font-size: 28px;
+    font-weight: 800;
+    color: var(--accent);
+  }
+  .stat-box .label {
+    font-size: 12px;
+    color: var(--hint);
+    margin-top: 4px;
+  }
+  canvas {
+    max-height: 220px;
+  }
+  .empty {
+    text-align: center;
+    color: var(--hint);
+    padding: 40px 16px;
+  }
+  .loading {
+    text-align: center;
+    color: var(--hint);
+    padding: 40px 16px;
+  }
+</style>
+</head>
+<body>
+  <h1>📊 Sizning statistikangiz</h1>
+  <div id="content">
+    <div class="loading">Yuklanyapti...</div>
+  </div>
+
+<script>
+  const tg = window.Telegram?.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+  }
+
+  async function loadStats() {
+    const initData = tg ? tg.initData : "";
+    const content = document.getElementById("content");
+
+    try {
+      const res = await fetch("/api/stats?initData=" + encodeURIComponent(initData));
+      if (!res.ok) {
+        content.innerHTML = '<div class="empty">Ma\'lumotlarni yuklab bo\'lmadi. Botni Telegram ichida oching.</div>';
+        return;
+      }
+      const data = await res.json();
+      render(data);
+    } catch (e) {
+      content.innerHTML = '<div class="empty">Xatolik yuz berdi: ' + e.message + '</div>';
+    }
+  }
+
+  function render(data) {
+    const content = document.getElementById("content");
+    const goals = data.goals || [];
+    const ratings = data.ratings || [];
+
+    if (goals.length === 0 && ratings.length === 0) {
+      content.innerHTML = '<div class="empty">Hali ma\'lumot yo\'q.<br>Tasklar qo\'shing va kunlaringizni baholang \u2014 shunda shu yerda grafik paydo bo\'ladi.</div>';
+      return;
+    }
+
+    const totalDone = goals.reduce((s, g) => s + g.done, 0);
+    const totalTasks = goals.reduce((s, g) => s + g.total, 0);
+    const pct = totalTasks ? Math.round((totalDone / totalTasks) * 100) : 0;
+    const avgRating = ratings.length
+      ? (ratings.reduce((s, r) => s + r.rating, 0) / ratings.length).toFixed(1)
+      : "\u2014";
+
+    content.innerHTML = `
+      <div class="stat-row">
+        <div class="stat-box">
+          <div class="value">${pct}%</div>
+          <div class="label">Bajarilgan tasklar</div>
+        </div>
+        <div class="stat-box">
+          <div class="value">${avgRating}</div>
+          <div class="label">O'rtacha reyting</div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Kunlik bajarilish (%)</h2>
+        <canvas id="goalsChart"></canvas>
+      </div>
+      <div class="card">
+        <h2>Kunlik reyting (1-10)</h2>
+        <canvas id="ratingChart"></canvas>
+      </div>
+    `;
+
+    const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#7c5cff";
+    const hint = getComputedStyle(document.documentElement).getPropertyValue("--hint").trim() || "#9a9aa5";
+
+    const goalLabels = goals.map(g => g.date.slice(5));
+    const goalPercents = goals.map(g => g.total ? Math.round((g.done / g.total) * 100) : 0);
+
+    new Chart(document.getElementById("goalsChart"), {
+      type: "bar",
+      data: {
+        labels: goalLabels,
+        datasets: [{
+          data: goalPercents,
+          backgroundColor: accent,
+          borderRadius: 6,
+        }],
+      },
+      options: {
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { min: 0, max: 100, ticks: { color: hint }, grid: { color: "rgba(255,255,255,0.06)" } },
+          x: { ticks: { color: hint }, grid: { display: false } },
+        },
+      },
+    });
+
+    const ratingLabels = ratings.map(r => r.date.slice(5));
+    const ratingValues = ratings.map(r => r.rating);
+
+    new Chart(document.getElementById("ratingChart"), {
+      type: "line",
+      data: {
+        labels: ratingLabels,
+        datasets: [{
+          data: ratingValues,
+          borderColor: accent,
+          backgroundColor: accent + "33",
+          fill: true,
+          tension: 0.35,
+          pointRadius: 4,
+          pointBackgroundColor: accent,
+        }],
+      },
+      options: {
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { min: 0, max: 10, ticks: { color: hint }, grid: { color: "rgba(255,255,255,0.06)" } },
+          x: { ticks: { color: hint }, grid: { display: false } },
+        },
+      },
+    });
+  }
+
+  loadStats();
+</script>
+</body>
+</html>
